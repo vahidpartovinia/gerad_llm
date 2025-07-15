@@ -54,18 +54,31 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
-weight_decay = 1e-1
+weight_decay = 0.1
 beta1 = 0.9
-beta2 = 0.95
+beta2 = 0.99
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
-# learning rate decay settings
+# learning rate decay setti23rngs
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+
+# learning_rate = 1e-4
+# max_iters = 2000
+# weight_decay = 0.1
+# beta1 = 0.9
+# beta2 = 0.95
+# grad_clip = 1.0
+# decay_lr = True
+# warmup_iters = 100
+# lr_decay_iters = 2000
+# min_lr = 1e-5
+
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
@@ -252,8 +265,8 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
-# Record start time for total training duration
 training_start_time = time.time()
+
 
 while True:
 
@@ -266,7 +279,7 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
 
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, lr {lr:.6f}")
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, lr {lr:.6f}, current best val loss {best_val_loss:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -286,7 +299,7 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
-                print(f"saving checkpoint to {out_dir}, best val loss is {best_val_loss:.4f}")
+                print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
@@ -321,7 +334,6 @@ while True:
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
-
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
@@ -330,14 +342,12 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
 
-        # Calculate total elapsed training time
         total_elapsed = time.time() - training_start_time
         hours = int(total_elapsed // 3600)
         minutes = int((total_elapsed % 3600) // 60)
         seconds = total_elapsed % 60
 
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms, "
-              f"mfu {running_mfu * 100:.2f}%, total_time {hours:02d}:{minutes:02d}:{seconds:05.2f}")
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%, total elapsed time {hours:02}:{minutes:02}:{seconds:05.2f}")
 
     iter_num += 1
     local_iter_num += 1

@@ -54,15 +54,30 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+
 # adamw optimizer
-learning_rate = 6e-4 # max learning rate
+
+# Changes from the original file:
+# learning rate from 6e-4 to 1e-4
+# grad_clip from 1.0 to 0.5
+# weight decay from 1e-1 to 0.05
+# beta2 from 0.95 ti 0.99
+
+# used for constant_lr as well
+learning_rate = 3e-5 # max learning rate
 max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
-grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+grad_clip = 0.5 # clip gradients at this value, or disable if == 0.0
+
+# LR parameters
+patience = 5  # Number of evaluations without improvement before reducing LR
+early_stop_patience = 25  # Number of evaluations without improvement before stopping training
+lr_decay_factor = 0.5  # Multiply LR by this when reducing
+min_learning_rate = 1e-7  # Minimum learning rate to reduce to
+
 # learning rate decay settings
-decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
@@ -211,6 +226,13 @@ if compile:
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
+
+# LR parameters
+evaluations_without_improvement = 0  # Track evaluations, not iterations
+current_lr = learning_rate
+adaptive_lr_active = False  # Track if we're using adaptive LR
+
+
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
@@ -241,6 +263,50 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
+
+def apply_patience_scheduler(losses, best_val_loss, evaluations_without_improvement,
+                             current_lr, optimizer, patience, lr_decay_factor,
+                             min_learning_rate, early_stop_patience):
+    """
+    Apply patience-based learning rate scheduling and early stopping.
+
+    Returns:
+        tuple: (new_best_val_loss, new_evaluations_without_improvement,
+                new_current_lr, should_early_stop, should_save)
+    """
+    should_save = False
+    should_early_stop = False
+
+    if losses['val'] <= best_val_loss:
+        best_val_loss = losses['val']
+        evaluations_without_improvement = 0
+        print(f"New best val loss: {best_val_loss:.4f}")
+        should_save = True
+    else:
+        evaluations_without_improvement += 1
+        print(f"No improvement for {evaluations_without_improvement} evaluations (current best: {best_val_loss:.4f})")
+
+        # Early stopping check
+        if evaluations_without_improvement >= early_stop_patience:
+            print(f"Early stopping: No improvement for {early_stop_patience} evaluations")
+            should_early_stop = True
+            return best_val_loss, evaluations_without_improvement, current_lr, should_early_stop, should_save
+
+        # Reduce learning rate if stagnant
+        if evaluations_without_improvement % patience == 0 and current_lr > min_learning_rate:
+            old_lr = current_lr
+            current_lr *= lr_decay_factor
+            current_lr = max(current_lr, min_learning_rate)
+            print(f"Reduced learning rate from {old_lr:.2e} to {current_lr:.2e}")
+
+    # Apply the current learning rate if it was reduced
+    if current_lr < learning_rate:
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = current_lr
+        print(f"Using adaptive LR: {current_lr:.2e}")
+
+    return best_val_loss, evaluations_without_improvement, current_lr, should_early_stop, should_save
+
 # logging
 if wandb_log and master_process:
     import wandb
@@ -252,8 +318,13 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+
+
 # Record start time for total training duration
 training_start_time = time.time()
+should_save = False
+use_patience_scheduler = True  # Set to False for constant LR
+decay_lr = False
 
 while True:
 
@@ -266,7 +337,33 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
 
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, lr {lr:.6f}")
+        if use_patience_scheduler:
+            best_val_loss, evaluations_without_improvement, current_lr, should_early_stop, should_save = \
+                apply_patience_scheduler(losses, best_val_loss, evaluations_without_improvement,
+                                         current_lr, optimizer, patience, lr_decay_factor,
+                                         min_learning_rate, early_stop_patience)
+
+            # For patience scheduler, LR is already set inside the function
+            lr = current_lr  # Just for logging purposes
+
+            if should_early_stop:
+                break
+        else:
+            # For non-patience mode, set LR here
+            lr = get_lr(iter_num) if decay_lr else learning_rate
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
+
+            # Simple best loss tracking
+            if losses['val'] <= best_val_loss:
+                best_val_loss = losses['val']
+                print(f"New best val loss: {best_val_loss:.4f}")
+                should_save = True
+            else:
+                should_save = always_save_checkpoint
+
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, lr {lr:.2e}")
+
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -275,8 +372,8 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
+
+        if should_save:
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
@@ -286,8 +383,9 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
-                print(f"saving checkpoint to {out_dir}, best val loss is {best_val_loss:.4f}")
+                print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+
     if iter_num == 0 and eval_only:
         break
 
