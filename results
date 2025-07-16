@@ -1,0 +1,6 @@
+MMLU (without LoRA adaptation):
+Val loss : 2.1392
+Accuracy : 0.2760 + 0.02
+Time til best val loss: 3.5 hours
+
+
