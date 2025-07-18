@@ -63,7 +63,7 @@ def evaluate_mmlu_accuracy(model, tokenizer, dataset, device='cuda', max_samples
             with torch.no_grad():
                 outputs = model.generate(
                     input_ids,
-                    max_new_tokens=10,  # Increased to capture full answer
+                    max_new_tokens=3,  # Just enough for " A" or " B" etc.
                     temperature=0.1
                 )
 

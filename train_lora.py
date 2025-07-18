@@ -57,7 +57,11 @@ bias = False  # do we use bias inside LayerNorm and Linear layers?
 
 # LoRA params
 lora_rank = 1
-lora_alpha = 0.0  # set alpha to the first rank which is tried, then keep it fixed, and don't further tune it (see the paper for more info)
+lora_alpha = 1.0  # set alpha to the first rank which is tried, then keep it fixed, and don't further tune it (see the paper for more info)
+lora_dropout = 0.1
+compute_grad_memory = False  # compute the memory usage of the gradients# LoRA params
+lora_rank = 1
+lora_alpha = 1.0  # set alpha to the first rank which is tried, then keep it fixed, and don't further tune it (see the paper for more info)
 lora_dropout = 0.1
 compute_grad_memory = False  # compute the memory usage of the gradients
 
@@ -284,6 +288,8 @@ t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
 running_mfu = -1.0
+training_start_time = time.time()
+
 while True:
 
     # determine and set the learning rate for this iteration
@@ -316,6 +322,7 @@ while True:
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                print("saving done.")
     if iter_num == 0 and eval_only:
         break
 
@@ -366,7 +373,14 @@ while True:
         if local_iter_num >= 5:  # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms, mfu {running_mfu * 100:.2f}%")
+
+        total_elapsed = time.time() - training_start_time
+        hours = int(total_elapsed // 3600)
+        minutes = int((total_elapsed % 3600) // 60)
+        seconds = total_elapsed % 60
+
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%, total elapsed time {hours:02}:{minutes:02}:{seconds:05.2f}")
+
     iter_num += 1
     local_iter_num += 1
 
