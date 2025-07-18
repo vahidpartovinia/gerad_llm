@@ -1,0 +1,12 @@
+# Ignore model checkpoints and large files
+*.pt
+*.pth
+*.bin
+*.ckpt
+
+# Ignore dataset and checkpoint directories
+/data/
+/pretraining/checkpoints/
+/finetuning/checkpoints/
+/rlhf/checkpoints/
+/hh_rlhf_local/ 

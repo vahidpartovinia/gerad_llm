@@ -1,0 +1,21 @@
+nano:
+  vocab_size: null
+  block_size: 128
+  n_layer: 6
+  n_head: 8
+  n_embd: 384
+  dropout: 0.1
+  bias: true
+  weight_init: xavier
+  max_iters: 5000  # Number of training iterations
+  data_fraction: 1.0  # Fraction of dataset to use (1.0 = 100%)
+
+tiny:
+  vocab_size: 50257
+  block_size: 256
+  n_layer: 12
+  n_head: 12
+  n_embd: 768
+  dropout: 0.1
+  bias: true
+  weight_init: xavier 

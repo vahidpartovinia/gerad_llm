@@ -1,0 +1,25 @@
+# RLHF configuration file
+
+reward_model:
+  model_type: nano-gpt  # or gpt2
+  pretrained_checkpoint: gerad_llm/pretraining/checkpoints/nano_gpt_shakespeare.pt
+  dataset_path: gerad_llm/hh_rlhf_local/train.jsonl
+  val_dataset_path: gerad_llm/hh_rlhf_local/test.jsonl
+  batch_size: 32
+  learning_rate: 1e-4
+  epochs: 3
+  save_dir: gerad_llm/rlhf/checkpoints/reward_model/
+  model_save_name: reward_model.pt
+  max_samples: 1000
+
+rlhf:
+  model_type: nano-gpt  # or gpt2
+  pretrained_checkpoint: gerad_llm/finetuning/checkpoints/nano_gpt_sst2_finetuned_epoch3.pt
+  reward_model_checkpoint: gerad_llm/rlhf/checkpoints/reward_model/reward_model_on_gpt2_gpt2_epoch3.pt
+  prompts_path: gerad_llm/hh_rlhf_local/train.jsonl
+  batch_size: 8
+  learning_rate: 5e-5
+  epochs: 1
+  ppo_steps: 10000
+  save_dir: gerad_llm/rlhf/checkpoints/rlhf/
+  model_save_name: rlhf_model.pt 

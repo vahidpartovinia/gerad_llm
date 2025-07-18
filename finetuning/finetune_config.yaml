@@ -1,0 +1,27 @@
+selected_dataset: sst2
+
+sst2:
+  dataset: sst2
+  model_type: nano-gpt
+  data_dir: data/sst2
+  batch_size: 32
+  learning_rate: 2e-4
+  epochs: 3
+  eval_interval: 100
+  max_seq_length: 128
+  save_dir: ../checkpoints/
+  model_save_name: nano_gpt_sst2_finetuned.pt
+  gpt2_dir: ../../models/gpt2
+
+mmlu:
+  dataset: mmlu
+  model_type: gpt2
+  data_dir: data/mmlu
+  batch_size: 32
+  learning_rate: 1e-5
+  epochs: 5
+  eval_interval: 100
+  max_seq_length: 256
+  save_dir: finetuning/checkpoints/
+  model_save_name: gpt2_mmlu_finetuned.pt
+  gpt2_dir: ../../models/gpt2 
