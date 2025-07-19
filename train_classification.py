@@ -174,7 +174,6 @@ model_args['num_classes'] = 2  # For SST-2
 model_args['num_classes'] = 4  # For MMLU
 
 
-
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -186,27 +185,50 @@ if init_from == 'scratch':
     model = GPT(gptconf)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
-    # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
+
+    # force these config attributes to be equal
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
-    # create the model
+
+    # create the model with current model_args
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
     state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+
+    # fix the keys of the state dictionary
     unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
+    for k, v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
+
+    # Load model state dict
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+
+    if missing_keys:
+        print(f"Missing keys (will be randomly initialized): {missing_keys}")
+    if unexpected_keys:
+        print(f"Unexpected keys (will be ignored): {unexpected_keys}")
+
+    # Handle optimizer loading more carefully
+    checkpoint_has_classification_weights = not any('classification_head' in key for key in missing_keys)
+    current_model_has_classification_head = hasattr(model,
+                                                    'classification_head') and model.classification_head is not None
+
+    if checkpoint_has_classification_weights and current_model_has_classification_head:
+        # Both have classification head - safe to load optimizer
+        print("Loading optimizer state (architecture matches)")
+        optimizer.load_state_dict(checkpoint['optimizer'])
+    else:
+        # Architecture mismatch - don't load optimizer, start fresh
+        print("Architecture mismatch - starting optimizer from scratch")
+        print("This is normal when adding classification head to a base model")
+
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
@@ -223,12 +245,6 @@ model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
-
-# optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
-checkpoint = None # free up memory
 
 # compile the model
 if compile:
@@ -315,6 +331,8 @@ while True:
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
                     'config': config,
+                    'checkpoint_type': 'classification',
+                    'has_classification_head': hasattr(raw_model, 'classification_head'),
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
@@ -327,6 +345,8 @@ while True:
                 'iter_num': iter_num,
                 'best_val_loss': best_val_loss,
                 'config': config,
+                'checkpoint_type': 'classification',
+                'has_classification_head': hasattr(raw_model, 'classification_head'),
             }
             print(f"saving checkpoint to {out_dir}")
             torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
@@ -344,7 +364,9 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, classification_labels=Y)
+            logits, loss = model(X, targets=Y)
+            if loss is None:
+                raise ValueError("Loss is None. Check that classification_labels are passed and valid.")
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
