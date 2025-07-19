@@ -65,23 +65,13 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 # beta2 = 0.99
 # grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 
-# LoRA params
-lora_rank = 1
-lora_alpha = 1.0  # set alpha to the first rank which is tried, then keep it fixed, and don't further tune it (see the paper for more info)
-lora_dropout = 0.1
-compute_grad_memory = False  # compute the memory usage of the gradients# LoRA params
-lora_rank = 1
-lora_alpha = 1.0  # set alpha to the first rank which is tried, then keep it fixed, and don't further tune it (see the paper for more info)
-lora_dropout = 0.1
-compute_grad_memory = False  # compute the memory usage of the gradients
-
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
 weight_decay = 0.01
 beta1 = 0.9
-beta2 = 0.95
-grad_clip = 0.1 # clip gradients at this value, or disable if == 0.0
+beta2 = 0.999     # Changed from 0.95 to 0.999
+grad_clip = 1.0   # clip gradients at this value, or disable if == 0.0
 
 
 # learning rate decay setti23rngs
@@ -184,7 +174,7 @@ def load_data():
 train_sequences, train_labels, train_lengths, val_sequences, val_labels, val_lengths = load_data()
 
 
-def get_batch(split):
+def get_batch(split, balance_classes=True):
     if split == 'train':
         sequences = train_sequences
         labels = train_labels
@@ -194,10 +184,32 @@ def get_batch(split):
         labels = val_labels
         lengths = val_lengths
 
-    # Sample random indices
-    ix = torch.randint(len(labels), (batch_size,))
+    if balance_classes and split == 'train':
+        # Sample equal numbers from each class
+        unique_labels = np.unique(labels)
+        samples_per_class = batch_size // len(unique_labels)
 
-    # Get sequences and crop/pad to block_size
+        ix_list = []
+        for label in unique_labels:
+            label_indices = np.where(labels == label)[0]
+            sampled_indices = np.random.choice(label_indices,
+                                               min(samples_per_class, len(label_indices)),
+                                               replace=False)
+            ix_list.extend(sampled_indices)
+
+        # Fill remaining slots if needed
+        remaining = batch_size - len(ix_list)
+        if remaining > 0:
+            all_indices = np.arange(len(labels))
+            remaining_indices = np.random.choice(all_indices, remaining, replace=False)
+            ix_list.extend(remaining_indices)
+
+        ix = torch.tensor(ix_list[:batch_size])
+    else:
+        # Original random sampling
+        ix = torch.randint(len(labels), (batch_size,))
+
+    # Rest of the function remains the same
     x_batch = []
     y_batch = []
 
@@ -206,11 +218,9 @@ def get_batch(split):
         label = torch.tensor(labels[i], dtype=torch.long)
         length = lengths[i]
 
-        # Crop or pad to block_size
         if length > block_size:
             seq = seq[:block_size]
         else:
-            # Pad with zeros (which should be fine for GPT-2)
             pad_length = block_size - length
             seq = torch.cat([seq[:length], torch.zeros(pad_length, dtype=torch.long)])
 
@@ -267,7 +277,11 @@ elif init_from == 'resume':
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'num_classes']:
-        model_args[k] = checkpoint_model_args[k]
+        if k in checkpoint_model_args:
+            model_args[k] = checkpoint_model_args[k]
+        else:
+            if k == 'num_classes':
+                model_args[k] = NUM_CLASSES
 
     # create the model
     gptconf = GPTConfig(**model_args)
@@ -279,9 +293,18 @@ elif init_from == 'resume':
     for k,v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
+
+    missing_head = not any(key.startswith("classification_head") for key in state_dict)
+    model.load_state_dict(state_dict, strict=False)
+
+    if missing_head or not hasattr(model, "classification_head"):
+        model.classification_head = nn.Linear(model.config.n_embd, NUM_CLASSES).to(device)
+
+    model.load_state_dict(state_dict, strict=False)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+
+
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     override_args = dict(dropout=dropout, num_classes=NUM_CLASSES)
@@ -465,6 +488,10 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
+
+        if init_from == 'resume' and master_process:
+            debug_evaluate_samples(2)
+
         if iter_num == 0 and master_process:
             debug_evaluate_samples(2)
 
@@ -538,15 +565,6 @@ while True:
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
-
-    if compute_grad_memory:
-        # compute the gradient memory usage
-        grad_memory = 0
-        for p in model.parameters():
-            if p.grad is not None:
-                grad_memory += p.grad.numel() * p.grad.element_size()
-        grad_memory = grad_memory / 1024 ** 2
-        print(f"grad memory usage: {grad_memory:.2f} MB")
 
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
