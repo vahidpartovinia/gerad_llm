@@ -29,7 +29,7 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model_classification import GPTConfig, GPT, get_lora_model
+from model_classification import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -104,7 +104,7 @@ min_lr = 4e-6 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
-device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
@@ -228,6 +228,7 @@ def get_batch(split):
 
     return x, y
 
+iter_num = 0
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
 meta_vocab_size = None
@@ -262,107 +263,40 @@ elif init_from == 'resume':
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
+    print("model_args:", model_args)
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'lora_rank', 'lora_alpha']:
-        model_args[k] = checkpoint_model_args.get(k, 0)
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'num_classes']:
+        model_args[k] = checkpoint_model_args[k]
+
     # create the model
-
-    # LoRA fine-tuning?
-    if lora_rank > 0:
-        model_args['lora_rank'] = lora_rank
-        model_args['lora_alpha'] = lora_alpha
-        model_args['lora_dropout'] = lora_dropout
-
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
     unwanted_prefix = '_orig_mod.'
-    for k, v in list(state_dict.items()):
+    for k,v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
-
-    if lora_rank > 0:
-        # Only make LoRA weights tunable
-        print("Marking model as LoRA fine-tunable...")
-        model = get_lora_model(model)
-        print("Done.")
-
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
-    override_args = dict(
-        dropout=dropout,
-        lora_rank=lora_rank,
-        lora_alpha=lora_alpha,
-        lora_dropout=lora_dropout,
-    )
+    override_args = dict(dropout=dropout, num_classes=NUM_CLASSES)
     model = GPT.from_pretrained(init_from, override_args)
-    # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'lora_rank', 'lora_alpha']:
-        model_args[k] = getattr(model.config, k)
-
-    if lora_rank > 0:
-        # Only make LoRA weights tunable
-        print("Marking model as LoRA fine-tunable...")
-        model = get_lora_model(model)
-        print("Done.")
-
-elif init_from.startswith('gpt2'):
-    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
-    model.config.num_classes = NUM_CLASSES
-    model.classification_head = nn.Linear(model.config.n_embd, model.config.num_classes)
-
-    model.config.lora_rank = lora_rank
-    model.config.lora_alpha = lora_alpha
-    model.config.lora_dropout = lora_dropout
-
+    # If the classification head is missing, add it:
+    if not hasattr(model, "classification_head"):
+        model.classification_head = nn.Linear(model.config.n_embd, NUM_CLASSES).to(device)
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
-
-    if lora_rank > 0:
-        # Only make LoRA weights tunable
-        print("Marking model as LoRA fine-tunable...")
-        model = get_lora_model(model)
-        print("Done.")
-
-    # crop down the model block size if desired, using model surgery
-    if block_size < model.config.block_size:
-        model.crop_block_size(block_size)
-        model_args['block_size'] = block_size # so that the checkpoint will have the right value
-
-    # Set up LoRA if specified
-    if lora_rank > 0:
-        print("Setting up LoRA fine-tuning...")
-        for name, param in model.named_parameters():
-            if 'classification_head' in name:
-                param.requires_grad = True  # Always train the classification head
-            elif any(x in name for x in ['wte', 'wpe', 'ln', 'bias']):
-                param.requires_grad = False  # Freeze embeddings and layer norms
-            else:
-                param.requires_grad = False  # Freeze other weights initially
-
-        # You could implement LoRA here or just train the classification head + some layers
-        # For simplicity, let's train the classification head and the last few transformer layers
-        for i, block in enumerate(model.transformer.h):
-            if i >= len(model.transformer.h) - 2:  # Last 2 layers
-                for param in block.parameters():
-                    param.requires_grad = True
-    else:
-        # Fine-tune all parameters
-        for param in model.parameters():
-            param.requires_grad = True
-
-    model.to(device)
+# crop down the model block size if desired, using model surgery
+if block_size < model.config.block_size:
+    model.crop_block_size(block_size)
+    model_args['block_size'] = block_size # so that the checkpoint will have the right value
+model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
@@ -424,7 +358,7 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
-
+# OLD
 @torch.no_grad()
 def evaluate_samples(num_samples):
     """Evaluate model on a few samples and show predictions"""
@@ -459,6 +393,48 @@ def evaluate_samples(num_samples):
         print(f"Predicted: {pred_label} (confidence: {confidence[pred_label]:.3f})")
         print(f"Actual: {true_label}")
         print(f"Correct: {'✓' if pred_label == true_label else '✗'}")
+        (print("-" * 30))
+
+
+@torch.no_grad()
+def debug_evaluate_samples(num_samples):
+    model.eval()
+    X, Y = get_batch('val')
+
+    with ctx:
+        logits, _ = model(X, class_targets=Y)
+
+    predictions = torch.argmax(logits, dim=-1)
+    confidences = torch.softmax(logits, dim=-1)
+
+    print("=== TRAINING DEBUG ===")
+    print(f"Unique predictions: {torch.unique(predictions)}")
+    print(f"Prediction distribution: {torch.bincount(predictions)}")
+    print(f"Average confidence for class 0: {confidences[:, 0].mean():.3f}")
+    print(f"Average confidence for class 1: {confidences[:, 1].mean():.3f}")
+
+    # Check if model always predicts the same class
+    if len(torch.unique(predictions)) == 1:
+        print("⚠️  MODEL ALWAYS PREDICTS THE SAME CLASS!")
+
+    import tiktoken
+    enc = tiktoken.get_encoding("gpt2")
+    for i in range(min(num_samples, X.size(0))):
+        # Decode the input text
+        tokens = X[i].cpu().numpy()
+        # Remove padding zeros
+        non_zero_tokens = tokens[tokens != 0]
+        text = enc.decode(non_zero_tokens)
+
+        pred_label = predictions[i].item()
+        true_label = Y[i].item()
+        confidence = torch.softmax(logits[i], dim=-1)
+
+        print(f"Sample {i}:")
+        print(f"Text: {text}")
+        print(f"Predicted: {pred_label} (confidence: {confidence[pred_label]:.3f})")
+        print(f"Actual: {true_label}")
+        print(f"Correct: {'✓' if pred_label == true_label else '✗'}")
         print("-" * 30)
 
     model.train()
@@ -471,7 +447,6 @@ if wandb_log and master_process:
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
-iter_num = 0
 local_iter_num = 0
 best_val_loss = 1e9
 raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -490,8 +465,10 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
+        if iter_num == 0 and master_process:
+            debug_evaluate_samples(2)
 
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, best val loss {best_val_loss:.4f}, "
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, "
               f"train acc {losses['train_acc']:.3f}, val acc {losses['val_acc']:.3f}, lr {lr:.2e}")
 
         if wandb_log:
@@ -607,7 +584,7 @@ while True:
         print(f"Final: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, "
               f"train acc {losses['train_acc']:.3f}, val acc {losses['val_acc']:.3f}")
 
-        evaluate_samples(10)
+        evaluate_samples(2)
 
     # termination conditions
     if iter_num > max_iters:
