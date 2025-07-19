@@ -25,10 +25,11 @@ from contextlib import nullcontext
 import numpy as np
 import torch
 from peft import LoraConfig, get_peft_model
+from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model_classification import GPTConfig, GPT
+from model_classification import GPTConfig, GPT, get_lora_model
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -63,6 +64,16 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 # beta1 = 0.9
 # beta2 = 0.99
 # grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+
+# LoRA params
+lora_rank = 1
+lora_alpha = 1.0  # set alpha to the first rank which is tried, then keep it fixed, and don't further tune it (see the paper for more info)
+lora_dropout = 0.1
+compute_grad_memory = False  # compute the memory usage of the gradients# LoRA params
+lora_rank = 1
+lora_alpha = 1.0  # set alpha to the first rank which is tried, then keep it fixed, and don't further tune it (see the paper for more info)
+lora_dropout = 0.1
+compute_grad_memory = False  # compute the memory usage of the gradients
 
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
@@ -139,20 +150,23 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 data_dir = os.path.join('data', dataset)
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+        labels = np.memmap(os.path.join(data_dir, 'train_labels.bin'), dtype=np.int64, mode='r')
+
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+        labels = np.memmap(os.path.join(data_dir, 'val_labels.bin'), dtype=np.int64, mode='r')
+
+    ix = torch.randint(len(labels), (batch_size,))
+    x = torch.stack([torch.from_numpy((data[i:i + block_size]).astype(np.int64)) for i in ix])
+    class_targets = torch.tensor([labels[i] for i in ix], dtype=torch.long)
+
     if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+        x, class_targets = x.pin_memory().to(device, non_blocking=True), class_targets.pin_memory().to(device, non_blocking=True)
     else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+        x, class_targets = x.to(device), class_targets.to(device)
+    return x, class_targets
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -167,12 +181,15 @@ if os.path.exists(meta_path):
     meta_vocab_size = meta['vocab_size']
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
+task = 'sst2'
+if task == 'sst2':
+    NUM_CLASSES = 2
+elif task == 'mmlu':
+    NUM_CLASSES = 4
+
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
-model_args['num_classes'] = 2  # For SST-2
-model_args['num_classes'] = 4  # For MMLU
-
+                  bias=bias, vocab_size=None, dropout=dropout, num_classes=NUM_CLASSES) # start with model_args from command line
 
 if init_from == 'scratch':
     # init a new model from scratch
@@ -185,58 +202,62 @@ if init_from == 'scratch':
     model = GPT(gptconf)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
+    # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
-
-    # force these config attributes to be equal
+    # force these config attributes to be equal otherwise we can't even resume training
+    # the rest of the attributes (e.g. dropout) can stay as desired from command line
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
 
-    # create the model with current model_args
+    # LoRA fine-tuning?
+    if lora_rank > 0:
+        model_args['lora_rank'] = lora_rank
+        model_args['lora_alpha'] = lora_alpha
+        model_args['lora_dropout'] = lora_dropout
+
+    # create the model
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
     state_dict = checkpoint['model']
-
-    # fix the keys of the state dictionary
+    # fix the keys of the state dictionary :(
+    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
     unwanted_prefix = '_orig_mod.'
-    for k, v in list(state_dict.items()):
+    for k,v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-
-    # Load model state dict
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-
-    if missing_keys:
-        print(f"Missing keys (will be randomly initialized): {missing_keys}")
-    if unexpected_keys:
-        print(f"Unexpected keys (will be ignored): {unexpected_keys}")
-
-    # Handle optimizer loading more carefully
-    checkpoint_has_classification_weights = not any('classification_head' in key for key in missing_keys)
-    current_model_has_classification_head = hasattr(model,
-                                                    'classification_head') and model.classification_head is not None
-
-    if checkpoint_has_classification_weights and current_model_has_classification_head:
-        # Both have classification head - safe to load optimizer
-        print("Loading optimizer state (architecture matches)")
-        optimizer.load_state_dict(checkpoint['optimizer'])
-    else:
-        # Architecture mismatch - don't load optimizer, start fresh
-        print("Architecture mismatch - starting optimizer from scratch")
-        print("This is normal when adding classification head to a base model")
-
+    model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+
+    # LoRA fine-tuning?
+    if lora_rank > 0:
+        model_args['lora_rank'] = lora_rank
+        model_args['lora_alpha'] = lora_alpha
+        model_args['lora_dropout'] = lora_dropout
 
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
     override_args = dict(dropout=dropout)
     model = GPT.from_pretrained(init_from, override_args)
+    model.config.num_classes = NUM_CLASSES
+    model.classification_head = nn.Linear(model.config.n_embd, model.config.num_classes)
+
+    model.config.lora_rank = lora_rank
+    model.config.lora_alpha = lora_alpha
+    model.config.lora_dropout = lora_dropout
+
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
+
+    if lora_rank > 0:
+        # Only make LoRA weights tunable
+        print("Marking model as LoRA fine-tunable...")
+        model = get_lora_model(model)
+        print("Done.")
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
@@ -245,6 +266,12 @@ model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+
+# optimizer
+optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+if init_from == 'resume':
+    optimizer.load_state_dict(checkpoint['optimizer'])
+checkpoint = None # free up memory
 
 # compile the model
 if compile:
@@ -265,8 +292,13 @@ def estimate_loss():
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
-            # For classification, Y should be your class labels
-            logits, loss = model(X, targets=Y)
+            with ctx:
+                # print("class_targets shape:", Y.shape)
+                # print("class_targets dtype:", Y.dtype)
+                # print("class_targets values:", Y)
+                logits, loss = model(X, class_targets=Y)
+                if loss is None:
+                    raise ValueError("Loss is None. Check model forward and batch generation.")
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -298,6 +330,8 @@ local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 training_start_time = time.time()
+
+print("class_targets dtype:", Y.dtype)
 
 always_save_checkpoint = False
 
@@ -331,8 +365,6 @@ while True:
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
                     'config': config,
-                    'checkpoint_type': 'classification',
-                    'has_classification_head': hasattr(raw_model, 'classification_head'),
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
@@ -345,8 +377,6 @@ while True:
                 'iter_num': iter_num,
                 'best_val_loss': best_val_loss,
                 'config': config,
-                'checkpoint_type': 'classification',
-                'has_classification_head': hasattr(raw_model, 'classification_head'),
             }
             print(f"saving checkpoint to {out_dir}")
             torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
@@ -364,9 +394,7 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, targets=Y)
-            if loss is None:
-                raise ValueError("Loss is None. Check that classification_labels are passed and valid.")
+            logits, loss = model(X, class_targets=Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
@@ -379,6 +407,16 @@ while True:
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
+
+    if compute_grad_memory:
+        # compute the gradient memory usage
+        grad_memory = 0
+        for p in model.parameters():
+            if p.grad is not None:
+                grad_memory += p.grad.numel() * p.grad.element_size()
+        grad_memory = grad_memory / 1024 ** 2
+        print(f"grad memory usage: {grad_memory:.2f} MB")
+
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 

@@ -1,6 +1,10 @@
 """
-Full definition of a GPT Language Model with Classification Head, all of it in this single file.
-Extended from the original GPT implementation to support classification tasks like SST-2 and MMLU.
+Full definition of a GPT Language Model, all of it in this single file.
+References:
+1) the official GPT-2 TensorFlow implementation released by OpenAI:
+https://github.com/openai/gpt-2/blob/master/src/model.py
+2) huggingface/transformers PyTorch implementation:
+https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
 import math
@@ -10,6 +14,106 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+
+class LoRALinear(nn.Linear):
+
+    def __init__(self,
+                 # nn.Linear parameters
+                 in_features: int,
+                 out_features: int,
+                 bias: bool = True,
+                 device=None,
+                 dtype=None,
+                 # LoRA parameters
+                 lora_rank: int = 0,
+                 lora_alpha: float = 0.0,
+                 lora_dropout: float = 0.0,
+                 ) -> None:
+        nn.Linear.__init__(
+            self,
+            in_features=in_features,
+            out_features=out_features,
+            bias=bias,
+            device=device,
+            dtype=dtype
+        )
+
+        # LoRA stuff
+        self.has_weights_merged = False
+        if lora_rank > 0:
+            self.lora_dropout = nn.Dropout(lora_dropout)
+
+            self.lora_scaling = lora_alpha / lora_rank
+            self.lora_A = nn.Parameter(torch.empty((lora_rank, self.in_features), device=device, dtype=dtype))
+            self.lora_B = nn.Parameter(torch.empty((self.out_features, lora_rank), device=device, dtype=dtype))
+
+            self.lora_A.requires_grad = False
+            self.lora_B.requires_grad = False
+
+            self.reset_parameters()
+
+    def is_lora(self) -> bool:
+        return hasattr(self, 'lora_A')
+
+    def reset_parameters(self) -> None:
+        nn.Linear.reset_parameters(self)
+        if self.is_lora():
+            torch.nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))  # Same as nn.Linear
+            torch.nn.init.zeros_(self.lora_B)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        x = nn.Linear.forward(self, input)
+        if not self.has_weights_merged and self.is_lora():
+            # h = Wx + BAx * scaling
+            x += self.lora_scaling * F.linear(
+                F.linear(
+                    self.lora_dropout(input),
+                    self.lora_A
+                ),
+                self.lora_B
+            )
+        return x
+
+    def extra_repr(self) -> str:
+        out = nn.Linear.extra_repr(self)
+        if self.is_lora():
+            out += f', lora_rank={self.lora_A.shape[0]}, lora_scaling={self.lora_scaling}, lora_dropout={self.lora_dropout.p}'
+        return out
+
+    def train(self, mode: bool = True) -> "LoRALinear":
+        nn.Linear.train(self, mode)
+        if self.has_weights_merged and self.is_lora():
+            # de-merge weights, i.e., remove BA from W = W + BA
+            self.weight.data -= self.lora_scaling * self.lora_B @ self.lora_A
+            self.has_weights_merged = False
+        return self
+
+    def eval(self) -> "LoRALinear":
+        nn.Linear.eval(self)
+        if not self.has_weights_merged and self.is_lora():
+            # merge weights, i.e., add BA to W
+            self.weight.data += self.lora_scaling * self.lora_B @ self.lora_A
+            self.has_weights_merged = True
+        return self
+
+
+def get_lora_model(model: nn.Module) -> nn.Module:
+    for name, param in model.named_parameters():
+        if "lora" in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+    return model
+
+
+# @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
+def new_gelu(x):
+    """
+    Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
+    Reference: Gaussian Error Linear Units (GELU) paper: https://arxiv.org/abs/1606.08415
+    """
+    return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
 
 
 class LayerNorm(nn.Module):
@@ -117,10 +221,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    # Classification head parameters
-    num_classes: int = None  # Set this for classification tasks
-    classification_dropout: float = 0.1  # Dropout for classification head
-    pooling_strategy: str = "last"  # "last", "mean", "cls" - how to pool sequence for classification
+    num_classes: int = None
 
 
 class GPT(nn.Module):
@@ -139,21 +240,10 @@ class GPT(nn.Module):
             ln_f=LayerNorm(config.n_embd, bias=config.bias),
         ))
 
-        # Language modeling head
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
-        # Classification head (optional)
         if config.num_classes is not None:
-            self.classification_head = nn.Sequential(
-                nn.Dropout(config.classification_dropout),
-                nn.Linear(config.n_embd, config.n_embd),
-                nn.Tanh(),
-                nn.Dropout(config.classification_dropout),
-                nn.Linear(config.n_embd, config.num_classes)
-            )
-        else:
-            self.classification_head = None
+            self.classification_head = nn.Linear(config.n_embd, config.num_classes)
 
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
@@ -190,84 +280,37 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def pool_sequence(self, x, attention_mask=None):
-        """
-        Pool the sequence representations for classification.
-        Args:
-            x: (batch_size, seq_len, hidden_size)
-            attention_mask: (batch_size, seq_len) - 1 for real tokens, 0 for padding
-        Returns:
-            pooled: (batch_size, hidden_size)
-        """
-        if self.config.pooling_strategy == "last":
-            if attention_mask is not None:
-                # Get the last non-padded token for each sequence
-                seq_lengths = attention_mask.sum(dim=1) - 1  # -1 because we want 0-indexed
-                batch_idx = torch.arange(x.size(0), device=x.device)
-                return x[batch_idx, seq_lengths]
-            else:
-                return x[:, -1]  # Last token
-        elif self.config.pooling_strategy == "mean":
-            if attention_mask is not None:
-                # Masked mean pooling
-                masked_x = x * attention_mask.unsqueeze(-1)
-                seq_lengths = attention_mask.sum(dim=1, keepdim=True)
-                return masked_x.sum(dim=1) / seq_lengths
-            else:
-                return x.mean(dim=1)
-        elif self.config.pooling_strategy == "cls":
-            # Use first token (assumes CLS token is at position 0)
-            return x[:, 0]
-        else:
-            raise ValueError(f"Unknown pooling strategy: {self.config.pooling_strategy}")
-
-    def forward(self, idx, targets=None, attention_mask=None, classification_labels=None):
-        """
-        Args:
-            idx: (batch_size, seq_len) - input token indices
-            targets: (batch_size, seq_len) - target token indices for language modeling
-            attention_mask: (batch_size, seq_len) - attention mask (1 for real tokens, 0 for padding)
-            classification_labels: (batch_size,) - classification labels
-        Returns:
-            logits: language modeling logits if targets provided, else classification logits
-            loss: loss if targets/labels provided
-        """
+    def forward(self, idx, targets=None, class_targets=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
 
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)
+        # Embedding and positional encoding
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
         x = self.transformer.drop(tok_emb + pos_emb)
+
+        # Transformer blocks
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
 
-        # Determine if this is a classification task
-        is_classification = classification_labels is not None or (
-                    targets is None and self.classification_head is not None)
+        # Classification head
+        if class_targets is not None and hasattr(self, 'classification_head'):
+            # print("Using classification head:", class_targets.shape)
+            cls_logits = self.classification_head(x[:, -1, :])
+            # print("cls_logits shape:", cls_logits.shape)
+            loss = F.cross_entropy(cls_logits, class_targets)
+            return cls_logits, loss
 
-        if is_classification and self.classification_head is not None:
-            # Classification forward pass
-            pooled = self.pool_sequence(x, attention_mask)
-            logits = self.classification_head(pooled)
-
-            if classification_labels is not None:
-                loss = F.cross_entropy(logits, classification_labels)
-            else:
-                loss = None
+        # Language modeling head
+        if targets is not None:
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
-            # Language modeling forward pass
-            if targets is not None:
-                # if we are given some desired targets also calculate the loss
-                logits = self.lm_head(x)
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-            else:
-                # inference-time mini-optimization: only forward the lm_head on the very last position
-                logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim
-                loss = None
+            logits = self.lm_head(x[:, [-1], :])
+            loss = None
 
         return logits, loss
 
@@ -286,9 +329,8 @@ class GPT(nn.Module):
     def from_pretrained(cls, model_type, override_args=None):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {}  # default to empty dict
-        # allow overriding dropout and classification parameters
-        allowed_overrides = {'dropout', 'num_classes', 'classification_dropout', 'pooling_strategy'}
-        assert all(k in allowed_overrides for k in override_args)
+        # only dropout can be overridden see more notes below
+        assert all(k == 'dropout' for k in override_args)
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
 
@@ -303,18 +345,16 @@ class GPT(nn.Module):
         config_args['vocab_size'] = 50257  # always 50257 for GPT model checkpoints
         config_args['block_size'] = 1024  # always 1024 for GPT model checkpoints
         config_args['bias'] = True  # always True for GPT model checkpoints
-
-        # Apply overrides
-        config_args.update(override_args)
-
+        # we can override the dropout rate, if desired
+        if 'dropout' in override_args:
+            print(f"overriding dropout rate to {override_args['dropout']}")
+            config_args['dropout'] = override_args['dropout']
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
         model = GPT(config)
         sd = model.state_dict()
         sd_keys = sd.keys()
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]  # discard this mask / buffer, not a param
-        sd_keys = [k for k in sd_keys if
-                   not k.startswith('classification_head')]  # don't load classification head from pretrained
 
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
@@ -391,6 +431,8 @@ class GPT(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        eos_token_id = 50256
+
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
@@ -402,61 +444,17 @@ class GPT(nn.Module):
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
+
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
+
+            # CHECK FOR EOS TOKEN AFTER SAMPLING:
+            if idx_next.item() == eos_token_id:
+                break
+
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
-
-    @torch.no_grad()
-    def classify(self, idx, attention_mask=None):
-        """
-        Classify input sequences.
-        Args:
-            idx: (batch_size, seq_len) - input token indices
-            attention_mask: (batch_size, seq_len) - attention mask
-        Returns:
-            logits: (batch_size, num_classes) - classification logits
-            probs: (batch_size, num_classes) - classification probabilities
-        """
-        assert self.classification_head is not None, "No classification head found"
-        self.eval()
-        logits, _ = self(idx, attention_mask=attention_mask)
-        probs = F.softmax(logits, dim=-1)
-        return logits, probs
-
-
-# Example usage functions
-def create_sst2_model():
-    """Create a GPT model for SST-2 sentiment analysis (2 classes)"""
-    config = GPTConfig(
-        num_classes=2,  # negative, positive
-        pooling_strategy="last",
-        classification_dropout=0.1
-    )
-    return GPT(config)
-
-
-def create_mmlu_model():
-    """Create a GPT model for MMLU multiple choice (4 classes)"""
-    config = GPTConfig(
-        num_classes=4,  # A, B, C, D
-        pooling_strategy="last",
-        classification_dropout=0.1
-    )
-    return GPT(config)
-
-
-def load_pretrained_for_classification(model_type, num_classes, pooling_strategy="last"):
-    """Load a pretrained GPT model and add classification head"""
-    return GPT.from_pretrained(
-        model_type,
-        override_args={
-            'num_classes': num_classes,
-            'pooling_strategy': pooling_strategy,
-            'classification_dropout': 0.1
-        }
-    )
