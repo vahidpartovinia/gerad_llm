@@ -29,7 +29,7 @@ class LoRALinear(nn.Linear):
                  lora_rank: int = 0,
                  lora_alpha: float = 0.0,
                  lora_dropout: float = 0.0,
-                 ) -> None:
+                ) -> None:
         nn.Linear.__init__(
             self,
             in_features=in_features,
@@ -59,7 +59,7 @@ class LoRALinear(nn.Linear):
     def reset_parameters(self) -> None:
         nn.Linear.reset_parameters(self)
         if self.is_lora():
-            torch.nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))  # Same as nn.Linear
+            torch.nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5)) # Same as nn.Linear
             torch.nn.init.zeros_(self.lora_B)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
@@ -97,7 +97,6 @@ class LoRALinear(nn.Linear):
             self.has_weights_merged = True
         return self
 
-
 def get_lora_model(model: nn.Module) -> nn.Module:
     for name, param in model.named_parameters():
         if "lora" in name:
@@ -105,7 +104,6 @@ def get_lora_model(model: nn.Module) -> nn.Module:
         else:
             param.requires_grad = False
     return model
-
 
 # @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
 def new_gelu(x):
@@ -133,10 +131,24 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+
+        self.c_attn = LoRALinear(
+            in_features=config.n_embd,
+            out_features=3 * config.n_embd,
+            bias=config.bias,
+            lora_rank=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout
+        )
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj = LoRALinear(
+            in_features=config.n_embd,
+            out_features=config.n_embd,
+            bias=config.bias,
+            lora_rank=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout
+        )
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -222,6 +234,10 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     num_classes: int = None
+    # LoRA parameters
+    lora_rank: int = 0
+    lora_alpha: float = 0.0
+    lora_dropout: float = 0.0
 
 
 class GPT(nn.Module):
@@ -327,10 +343,13 @@ class GPT(nn.Module):
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
+        """
+        Loading pretrained GPT-2 models from HuggingFace hub.
+        """
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {}  # default to empty dict
         # only dropout can be overridden see more notes below
-        assert all(k == 'dropout' for k in override_args)
+        assert all(k == 'dropout' or k.startswith("lora") for k in override_args)
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
 
@@ -349,6 +368,13 @@ class GPT(nn.Module):
         if 'dropout' in override_args:
             print(f"overriding dropout rate to {override_args['dropout']}")
             config_args['dropout'] = override_args['dropout']
+        if 'lora_rank' in override_args:
+            print(f"overriding lora_rank and lora_alpha to {override_args['lora_rank']}")
+            config_args['lora_rank'] = override_args['lora_rank']
+            config_args['lora_alpha'] = override_args['lora_alpha']
+            if 'lora_dropout' in override_args:
+                print(f"overriding lora_dropout to {override_args['lora_dropout']}")
+                config_args['lora_dropout'] = override_args['lora_dropout']
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
         model = GPT(config)
@@ -367,7 +393,11 @@ class GPT(nn.Module):
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        if config.lora_rank == 0:
+            assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        else:
+            # Subtract the LoRA parameters from len(sd_keys)
+            assert len(sd_keys_hf) == len(sd_keys) - 4 * config.n_layer
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
@@ -383,28 +413,65 @@ class GPT(nn.Module):
         return model
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        # start with all of the candidate parameters
+        """
+        This long function is unfortunately doing something very simple and is being very defensive:
+        We are separating out all parameters of the model into two buckets: those that will experience
+        weight decay for regularization and those that won't (biases, and layernorm/embedding weights).
+        We are then returning the PyTorch optimizer object.
+        """
+
+        if self.config.lora_rank > 0:
+            # No special treatment for LoRA
+            return torch.optim.AdamW(self.parameters(), lr=learning_rate, betas=betas, weight_decay=weight_decay)
+
+        # separate out all parameters to those that will and won't experience regularizing weight decay
+        decay = set()
+        no_decay = set()
+        whitelist_weight_modules = (torch.nn.Linear,)
+        blacklist_weight_modules = (torch.nn.LayerNorm, LayerNorm, torch.nn.Embedding)
+        for mn, m in self.named_modules():
+            for pn, p in m.named_parameters():
+                fpn = '%s.%s' % (mn, pn) if mn else pn  # full param name
+                # random note: because named_modules and named_parameters are recursive
+                # we will see the same tensors p many many times. but doing it this way
+                # allows us to know which parent module any tensor p belongs to...
+                if pn.endswith('bias'):
+                    # all biases will not be decayed
+                    no_decay.add(fpn)
+                elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
+                    # weights of whitelist modules will be weight decayed
+                    decay.add(fpn)
+                elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
+                    # weights of blacklist modules will NOT be weight decayed
+                    no_decay.add(fpn)
+
+        # subtle: 'transformer.wte.weight' and 'lm_head.weight' are tied, so they
+        # will appear in the no_decay and decay sets respectively after the above.
+        # In addition, because named_parameters() doesn't return duplicates, it
+        # will only return the first occurence, key'd by 'transformer.wte.weight', below.
+        # so let's manually remove 'lm_head.weight' from decay set. This will include
+        # this tensor into optimization via transformer.wte.weight only, and not decayed.
+        decay.remove('lm_head.weight')
+
+        # validate that we considered every parameter
         param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        inter_params = decay & no_decay
+        union_params = decay | no_decay
+        assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params),)
+        assert len(
+            param_dict.keys() - union_params) == 0, "parameters %s were not separated into either decay/no_decay set!" \
+                                                    % (str(param_dict.keys() - union_params),)
+
+        # create the pytorch optimizer object
         optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
+            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": weight_decay},
+            {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
         ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
+        # new PyTorch nightly has a new 'fused' option for AdamW that is much faster
+        use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
+        print(f"using fused AdamW: {use_fused}")
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
 
         return optimizer
 

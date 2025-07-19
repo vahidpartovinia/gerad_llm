@@ -192,11 +192,11 @@ elif init_from == 'resume':
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
 
+    # LoRA fine-tuning?
     if lora_rank > 0:
-        # Only make LoRA weights tunable
-        print("Marking model as LoRA fine-tunable...")
-        model = get_lora_model(model)
-        print("Done.")
+        model_args['lora_rank'] = lora_rank
+        model_args['lora_alpha'] = lora_alpha
+        model_args['lora_dropout'] = lora_dropout
 
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
