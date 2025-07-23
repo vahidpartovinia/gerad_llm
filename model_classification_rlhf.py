@@ -176,6 +176,7 @@ class GPT(nn.Module):
             "attention_mask": attention_mask,
             "past_key_values": past_key_values,
             **kwargs
+
         }
 
     def _init_weights(self, module):
