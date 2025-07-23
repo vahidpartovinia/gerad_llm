@@ -156,6 +156,7 @@ if __name__ == "__main__":
     # -----------------------------------------------------------
 
     # To evaluate
+
     # Load base model
     model = GPT2LMHeadModel.from_pretrained("gpt2")
     # Load LoRA adapter
