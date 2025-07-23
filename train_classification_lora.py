@@ -24,12 +24,11 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
-from peft import LoraConfig, get_peft_model
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model_classification import GPTConfig, GPT
+from model_lora_classification import GPTConfig, GPT, get_lora_model
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -38,106 +37,87 @@ out_dir = 'out'
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
-eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+eval_only = False  # if True, script exits right after the first eval
+always_save_checkpoint = True  # if True, always save a checkpoint after each eval
+init_from = 'scratch'  # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
+wandb_log = False  # disabled by default
 wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_run_name = 'gpt2'  # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+gradient_accumulation_steps = 5  # used to simulate larger batch sizes
+batch_size = 12  # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
 n_layer = 12
 n_head = 12
 n_embd = 768
-dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
-bias = False # do we use bias inside LayerNorm and Linear layers?
+dropout = 0.0  # for pretraining 0 is good, for finetuning try 0.1+
+bias = False  # do we use bias inside LayerNorm and Linear layers?
 
-# adamw optimizer OLD/DEFAULT
-# learning_rate = 6e-4 # max learning rate
-# max_iters = 600000 # total number of training iterations
-# weight_decay = 0.1
-# beta1 = 0.9
-# beta2 = 0.99
-# grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+# LoRA params
+lora_rank = 1
+lora_alpha = 1.0  # set alpha to the first rank which is tried, then keep it fixed, and don't further tune it (see the paper for more info)
+lora_dropout = 0.1
+compute_grad_memory = False  # compute the memory usage of the gradients# LoRA params
+lora_rank = 1
+lora_alpha = 1.0  # set alpha to the first rank which is tried, then keep it fixed, and don't further tune it (see the paper for more info)
+lora_dropout = 0.1
+compute_grad_memory = False  # compute the memory usage of the gradients
 
 # adamw optimizer
-learning_rate = 6e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
-weight_decay = 0.01
+learning_rate = 6e-4  # max learning rate
+max_iters = 600000  # total number of training iterations
+weight_decay = 1e-1
 beta1 = 0.9
-beta2 = 0.999     # Changed from 0.95 to 0.999
-grad_clip = 1.0   # clip gradients at this value, or disable if == 0.0
-
-
-# learning rate decay setti23rngs
-decay_lr = True # whether to decay the learning rate
-warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
-min_lr = 4e-6 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
-
-# learning_rate = 1e-4
-# max_iters = 2000
-# weight_decay = 0.1
-# beta1 = 0.9
-# beta2 = 0.95
-# grad_clip = 1.0
-# decay_lr = True
-# warmup_iters = 100
-# lr_decay_iters = 2000
-# min_lr = 1e-5
-
+beta2 = 0.95
+grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0
+# learning rate decay settings
+decay_lr = True  # whether to decay the learning rate
+warmup_iters = 2000  # how many steps to warm up for
+lr_decay_iters = 600000  # should be ~= max_iters per Chinchilla
+min_lr = 6e-5  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
-backend = 'nccl' # 'nccl', 'gloo', etc.
+backend = 'nccl'  # 'nccl', 'gloo', etc.
 # system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+device = 'cuda'  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+dtype = 'bfloat16'  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+compile = True  # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
-config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open('configurator.py').read()) # overrides from command line or config file
-config = {k: globals()[k] for k in config_keys} # will be useful for logging
+config_keys = [k for k, v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+exec(open('configurator.py').read())  # overrides from command line or config file
+config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # -----------------------------------------------------------------------------
 
 # various inits, derived attributes, I/O setup
-ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+ddp = int(os.environ.get('RANK', -1)) != -1  # is this a ddp run?
 if ddp:
     init_process_group(backend=backend)
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
     device = f'cuda:{ddp_local_rank}'
     torch.cuda.set_device(device)
-    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-    seed_offset = ddp_rank # each process gets a different seed
-    # world_size number of processes will be training simultaneously, so we can scale
-    # down the desired gradient accumulation iterations per process proportionally
-    assert gradient_accumulation_steps % ddp_world_size == 0
-    gradient_accumulation_steps //= ddp_world_size
+    master_process = ddp_rank == 0  # this process will do logging, checkpointing etc.
+    seed_offset = ddp_rank  # each process gets a different seed
 else:
     # if not ddp, we are running on a single gpu, and one process
     master_process = True
     seed_offset = 0
-    ddp_world_size = 1
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
-print(f"tokens per iteration will be: {tokens_per_iter:,}")
+    gradient_accumulation_steps *= 8  # simulate 8 gpus
+print("total number of tokens per iteration:", batch_size * block_size * gradient_accumulation_steps)
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
 torch.manual_seed(1337 + seed_offset)
-torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
+torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
+device_type = 'cuda' if 'cuda' in device else 'cpu'  # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-# Load metadata
 data_dir = os.path.join('data', dataset)
 meta_path = os.path.join(data_dir, 'meta.pkl')
 with open(meta_path, 'rb') as f:
@@ -238,7 +218,11 @@ def get_batch(split, balance_classes=True):
 
     return x, y
 
+
+# init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
+best_val_loss = 1e9
+
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
 meta_vocab_size = None
@@ -248,16 +232,17 @@ if os.path.exists(meta_path):
     meta_vocab_size = meta['vocab_size']
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
+# model init
+# Note: we only want to do LoRA fine-tuning when we resume or start with a pretrained model and NOT when we start from scratch
+
 task = 'sst2'
 if task == 'sst2':
     NUM_CLASSES = 2
 elif task == 'mmlu':
     NUM_CLASSES = 4
 
-# model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout, num_classes=NUM_CLASSES) # start with model_args from command line
-
+                  bias=bias, vocab_size=None, dropout=dropout)  # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -273,7 +258,6 @@ elif init_from == 'resume':
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
-    print("model_args:", model_args)
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'num_classes']:
@@ -282,17 +266,24 @@ elif init_from == 'resume':
         else:
             if k == 'num_classes':
                 model_args[k] = NUM_CLASSES
-
     # create the model
+
+    # LoRA fine-tuning?
+    if lora_rank > 0:
+        model_args['lora_rank'] = lora_rank
+        model_args['lora_alpha'] = lora_alpha
+        model_args['lora_dropout'] = lora_dropout
+
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
     unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
+    for k, v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+
 
     missing_head = not any(key.startswith("classification_head") for key in state_dict)
     model.load_state_dict(state_dict, strict=False)
@@ -301,24 +292,43 @@ elif init_from == 'resume':
         model.classification_head = nn.Linear(model.config.n_embd, NUM_CLASSES).to(device)
 
     model.load_state_dict(state_dict, strict=False)
+
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
 
+    # LoRA fine-tuning?
+    if lora_rank > 0:
+        model_args['lora_rank'] = lora_rank
+        model_args['lora_alpha'] = lora_alpha
+        model_args['lora_dropout'] = lora_dropout
 
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    override_args = dict(dropout=dropout, num_classes=NUM_CLASSES)
+    # initialize from OpenAI GPT-2 weights
+    override_args = dict(
+        dropout=dropout,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+    )
     model = GPT.from_pretrained(init_from, override_args)
-    # If the classification head is missing, add it:
+    # read off the created config params, so we can store them into checkpoint correctly
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'lora_rank', 'lora_alpha']:
+        model_args[k] = getattr(model.config, k)
+
+    if lora_rank > 0:
+        # Only make LoRA weights tunable
+        print("Marking model as LoRA fine-tunable...")
+        model = get_lora_model(model)
+        print("Done.")
+
     if not hasattr(model, "classification_head"):
         model.classification_head = nn.Linear(model.config.n_embd, NUM_CLASSES).to(device)
-    # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = getattr(model.config, k)
+
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
-    model_args['block_size'] = block_size # so that the checkpoint will have the right value
+    model_args['block_size'] = block_size  # so that the checkpoint will have the right value
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
@@ -327,18 +337,23 @@ scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
-checkpoint = None # free up memory
+    try:
+        optimizer.load_state_dict(checkpoint['optimizer'])
+    except ValueError as e:
+        print(f"Warning: Could not load optimizer state due to parameter mismatch: {e}")
+        print("Initializing optimizer from scratch (common when changing model architecture)")
+checkpoint = None
 
 # compile the model
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
-    model = torch.compile(model) # requires PyTorch 2.0
+    model = torch.compile(model)  # requires PyTorch 2.0
 
 # wrap model into DDP container
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
+
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -354,6 +369,7 @@ def estimate_loss():
             X, Y = get_batch(split)
             with ctx:
                 logits, loss = model(X, class_targets=Y)
+
             losses[k] = loss.item()
 
             # Calculate accuracy
@@ -366,6 +382,7 @@ def estimate_loss():
 
     model.train()
     return out
+
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -461,22 +478,18 @@ def debug_evaluate_samples(num_samples):
         print("-" * 30)
 
     model.train()
-
 # logging
 if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+X, Y = get_batch('train')  # fetch the very first batch
 t0 = time.time()
-local_iter_num = 0
-best_val_loss = 1e9
-raw_model = model.module if ddp else model # unwrap DDP container if needed
+local_iter_num = 0  # number of iterations in the lifetime of this process
+raw_model = model.module if ddp else model  # unwrap DDP container if needed
 running_mfu = -1.0
 training_start_time = time.time()
-
-always_save_checkpoint = False
 
 while True:
 
