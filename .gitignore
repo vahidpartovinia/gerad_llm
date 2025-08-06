@@ -4,3 +4,8 @@ __pycache__/
 *.pyd
 .DS_Store
 */.DS_Store
+/training/rlhf/best_ppo_model/
+/training/rlhf/ppo_checkpoints/
+/training/rlhf/reward_model/
+/training/rlhf/reward_model_shakespeare/
+/training/rlhf/simple_ppo_model/
