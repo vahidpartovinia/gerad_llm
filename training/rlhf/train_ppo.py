@@ -341,7 +341,7 @@ def train_ppo():
     print("Using manual PPO-style training...")
 
     # Manual PPO-style training loop
-    optimizer = torch.optim.Adam(policy_model.parameters(), lr=2e-6)  # Increased from 1e-6
+    optimizer = torch.optim.Adam(policy_model.parameters(), lr=1e-5)  # Increased from 1e-6
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.9)
 
     best_loss = float('inf')

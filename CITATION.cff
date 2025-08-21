@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "Citation file"
+title: "Arad Joliny's work on GERAD Summer Internship 2025"
+authors:
+  - family-names: "Joliny"
+    given-names: "Arad"
+    affiliation: "University of Edinburgh, University of McGill"
+date-released: "2025-08-21"
+version: "1.0.0"
+url: "https://github.com/AradJoliny/gerad_llm.git"

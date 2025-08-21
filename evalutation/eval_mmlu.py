@@ -66,7 +66,7 @@ enc = tiktoken.get_encoding("gpt2")
 
 # Load model
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from model_classification import GPTConfig, GPT
+from models.mmlu_sst2.model_classification import GPTConfig, GPT
 
 device = 'mps' if torch.backends.mps.is_available() else 'cpu'
 print(f"Using device: {device}")

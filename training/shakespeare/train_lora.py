@@ -27,7 +27,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model_lora import GPTConfig, GPT, get_lora_model
+from models.shakespeare.model_lora import GPTConfig, GPT, get_lora_model
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -199,6 +199,7 @@ elif init_from == 'resume':
         model_args['lora_dropout'] = lora_dropout
 
 elif init_from.startswith('gpt2'):
+
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
     override_args = dict(
